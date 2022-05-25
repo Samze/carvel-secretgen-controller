@@ -5,12 +5,15 @@ package generator
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
+	"os"
+	"time"
 
-	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/types"
+	"github.com/vmware-tanzu/carvel-secretgen-controller/pkg/satoken"
+	authv1 "k8s.io/api/authentication/v1"
 	"k8s.io/client-go/rest"
-	certutil "k8s.io/client-go/util/cert"
+	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrl "sigs.k8s.io/controller-runtime/pkg/client/config"
 )
@@ -23,12 +26,14 @@ const (
 
 // ServiceAccountLoader allows the construction of a k8s client from a Service Account
 type ServiceAccountLoader struct {
-	client client.Client // Used to load service accounts and their secrets.
+	tokenManager *satoken.Manager
 }
 
 // NewServiceAccountLoader creates a new ServiceAccountLoader
-func NewServiceAccountLoader(client client.Client) *ServiceAccountLoader {
-	return &ServiceAccountLoader{client}
+func NewServiceAccountLoader(tokenManager *satoken.Manager) *ServiceAccountLoader {
+	return &ServiceAccountLoader{
+		tokenManager: tokenManager,
+	}
 }
 
 // Client returns a new k8s client for a Service Account
@@ -46,57 +51,58 @@ func (s *ServiceAccountLoader) restConfig(ctx context.Context, saName, saNamespa
 	if err != nil {
 		return nil, err
 	}
-
-	token, cert, err := s.serviceAccountCredentials(ctx, saName, saNamespace)
+	expiration := int64(time.Hour.Seconds())
+	tokenRequest, err := s.tokenManager.GetServiceAccountToken(saNamespace, saName, &authv1.TokenRequest{
+		Spec: authv1.TokenRequestSpec{
+			ExpirationSeconds: &expiration,
+		},
+	})
 	if err != nil {
 		return nil, err
 	}
 
-	if _, err := certutil.NewPoolFromBytes(cert); err != nil {
-		return nil, fmt.Errorf("expected to load root CA config, but got err: %v", err)
+	var caData []byte
+	if len(cfg.CAData) > 0 {
+		caData = cfg.CAData
+	}
+	if cfg.CAFile != "" {
+		caData, err = os.ReadFile(cfg.CAFile)
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	return &rest.Config{
-		Host: cfg.Host,
-		TLSClientConfig: rest.TLSClientConfig{
-			CAData: cert,
-		},
-		BearerToken: string(token),
-	}, nil
+	templatedConfig, err := templateKubeconfig(cfg.Host, tokenRequest.Status.Token, saNamespace, caData)
+	if err != nil {
+		return nil, err
+	}
+
+	return clientcmd.RESTConfigFromKubeConfig([]byte(templatedConfig))
 }
 
-func (s *ServiceAccountLoader) serviceAccountCredentials(ctx context.Context, name, namespace string) ([]byte, []byte, error) {
-	sa := corev1.ServiceAccount{}
-	if err := s.client.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, &sa); err != nil {
-		return nil, nil, fmt.Errorf("unable to fetch service account %s:%s, %w", namespace, name, err)
-	}
+func templateKubeconfig(host, token, nsBytes string, caCert []byte) (string, error) {
+	const kubeconfigYAMLTpl = `
+apiVersion: v1
+kind: Config
+clusters:
+- name: dst-cluster
+  cluster:
+    certificate-authority-data: "%s"
+    server: "%s"
+users:
+- name: dst-user
+  user:
+    token: "%s"
+contexts:
+- name: dst-ctx
+  context:
+    cluster: dst-cluster
+    namespace: "%s"
+    user: dst-user
+current-context: dst-ctx
+`
 
-	if len(sa.Secrets) == 0 {
-		return nil, nil, fmt.Errorf("no secrets found for service account %s:%s", namespace, name)
-	}
+	caB64Encoded := base64.StdEncoding.EncodeToString(caCert)
 
-	for _, secretRef := range sa.Secrets {
-		secret := corev1.Secret{}
-		if err := s.client.Get(ctx, types.NamespacedName{Namespace: namespace, Name: secretRef.Name}, &secret); err != nil {
-			return nil, nil, fmt.Errorf("failed to fetch secret %s:%s, %w", namespace, secretRef.Name, err)
-		}
-
-		if secret.Type != saTokenType {
-			continue
-		}
-
-		tokenData, tokenFound := secret.Data[tokenKey]
-		if !tokenFound {
-			return nil, nil, fmt.Errorf("secret %s:%s does not contain %s field", namespace, secretRef.Name, tokenKey)
-		}
-
-		certData, certFound := secret.Data[caCert]
-		if !certFound {
-			return nil, nil, fmt.Errorf("secret %s:%s does not contain %s field", namespace, secretRef.Name, caCert)
-		}
-
-		return tokenData, certData, nil
-	}
-
-	return nil, nil, fmt.Errorf("serviceaccount %s:%s did not reference any secret of type %s", namespace, name, saTokenType)
+	return fmt.Sprintf(kubeconfigYAMLTpl, caB64Encoded, host, []byte(token), []byte(nsBytes)), nil
 }
