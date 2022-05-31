@@ -6,10 +6,12 @@ package reconciler
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	sgv1alpha1 "github.com/vmware-tanzu/carvel-secretgen-controller/pkg/apis/secretgen/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
@@ -22,6 +24,16 @@ type TerminalReconcileErr struct {
 }
 
 func (e TerminalReconcileErr) Error() string { return e.Err.Error() }
+
+// RequeueReconcileErr represent a reconciliation error that
+// should be requeued but without using controller-runtimes
+// exponential backoff mechanism. Instead requeue at an interval.
+type RequeueReconcileErr struct {
+	RequeueAfter time.Duration
+	Err          error
+}
+
+func (e RequeueReconcileErr) Error() string { return e.Err.Error() }
 
 type Status struct {
 	S          sgv1alpha1.GenericStatus
@@ -90,6 +102,11 @@ func (s *Status) WithReconcileCompleted(result reconcile.Result, err error) (rec
 	if err != nil {
 		if _, ok := err.(TerminalReconcileErr); ok {
 			return reconcile.Result{}, nil
+		}
+		if requeueErr, ok := err.(RequeueReconcileErr); ok {
+			return reconcile.Result{
+				RequeueAfter: requeueErr.RequeueAfter + wait.Jitter(time.Second*5, 1.0),
+			}, nil
 		}
 	}
 	return result, err

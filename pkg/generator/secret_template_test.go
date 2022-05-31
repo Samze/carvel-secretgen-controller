@@ -453,10 +453,12 @@ func Test_SecretTemplate(t *testing.T) {
 
 func Test_SecretTemplate_Errors(t *testing.T) {
 	type test struct {
-		name            string
-		template        sg2v1alpha1.SecretTemplate
-		existingObjects []client.Object
-		expectedError   string
+		name                  string
+		template              sg2v1alpha1.SecretTemplate
+		existingObjects       []client.Object
+		expectedErrorReturn   bool
+		expectedRequeueReturn bool
+		expectedErrorMsg      string
 	}
 
 	tests := []test{
@@ -473,7 +475,7 @@ func Test_SecretTemplate_Errors(t *testing.T) {
 						Ref: sg2v1alpha1.InputResourceRef{
 							APIVersion: "v1",
 							Kind:       "Secret",
-							Name:       "existingSecret",
+							Name:       "nonexistingSecret",
 						},
 					}},
 					JSONPathTemplate: &sg2v1alpha1.JSONPathTemplate{
@@ -487,7 +489,9 @@ func Test_SecretTemplate_Errors(t *testing.T) {
 					},
 				},
 			},
-			expectedError: "cannot fetch input resource existingSecret: secrets \"existingSecret\" not found",
+			expectedErrorReturn:   true,
+			expectedRequeueReturn: false,
+			expectedErrorMsg:      "cannot fetch input resource nonexistingSecret: secrets \"nonexistingSecret\" not found",
 		},
 		{
 			name: "reconciling secret template referencing a resource with invalid apiversion",
@@ -517,7 +521,9 @@ func Test_SecretTemplate_Errors(t *testing.T) {
 					},
 				},
 			},
-			expectedError: "unable to resolve input resource creds: unexpected GroupVersion string: //v1",
+			expectedErrorReturn:   false,
+			expectedRequeueReturn: true,
+			expectedErrorMsg:      "unable to resolve input resource creds: unexpected GroupVersion string: //v1",
 		},
 		{
 			name: "reconciling secret template with jsonpath that doesn't evaluate in data",
@@ -555,7 +561,9 @@ func Test_SecretTemplate_Errors(t *testing.T) {
 					"key3": "value3",
 				}),
 			},
-			expectedError: "templating data: doesntExist1 is not found",
+			expectedErrorReturn:   true,
+			expectedRequeueReturn: false,
+			expectedErrorMsg:      "templating data: doesntExist1 is not found",
 		},
 		{
 			name: "reconciling secret template with jsonpath that doesn't evaluate in stringdata",
@@ -589,7 +597,7 @@ func Test_SecretTemplate_Errors(t *testing.T) {
 					"key1": "prefix-value1-suffix",
 				}),
 			},
-			expectedError: "templating stringData: doesntExist is not found",
+			expectedErrorMsg: "templating stringData: doesntExist is not found",
 		},
 		{
 			name: "reconciling secret template with jsonpath that doesn't evaluate in annotations",
@@ -622,7 +630,9 @@ func Test_SecretTemplate_Errors(t *testing.T) {
 					"inputKey1": "value1",
 				}),
 			},
-			expectedError: "templating annotations: doesntExist is not found",
+			expectedErrorReturn:   false,
+			expectedRequeueReturn: true,
+			expectedErrorMsg:      "templating annotations: doesntExist is not found",
 		},
 		{
 			name: "reconciling secret template with jsonpath that doesn't evaluate in labels",
@@ -655,7 +665,9 @@ func Test_SecretTemplate_Errors(t *testing.T) {
 					"inputKey1": "value1",
 				}),
 			},
-			expectedError: "templating labels: doesntExist is not found",
+			expectedErrorReturn:   false,
+			expectedRequeueReturn: true,
+			expectedErrorMsg:      "templating labels: doesntExist is not found",
 		},
 		{
 			name: "reconciling secret template with jsonpath that doesn't evaluate in labels",
@@ -684,7 +696,9 @@ func Test_SecretTemplate_Errors(t *testing.T) {
 					"inputKey1": "Opaque",
 				}),
 			},
-			expectedError: "templating type: doesntExist is not found",
+			expectedErrorReturn:   false,
+			expectedRequeueReturn: true,
+			expectedErrorMsg:      "templating type: doesntExist is not found",
 		},
 		{
 			name: "reconciling secret template referencing non-secret without service account",
@@ -715,7 +729,9 @@ func Test_SecretTemplate_Errors(t *testing.T) {
 					"inputKey1": "value1",
 				}),
 			},
-			expectedError: "unable to load non-secrets without a specified serviceaccount",
+			expectedErrorReturn:   true,
+			expectedRequeueReturn: false,
+			expectedErrorMsg:      "unable to load non-secrets without a specified serviceaccount",
 		},
 	}
 
@@ -724,15 +740,23 @@ func Test_SecretTemplate_Errors(t *testing.T) {
 			allObjects := append(tc.existingObjects, &tc.template)
 			secretTemplateReconciler, k8sClient := newReconciler(allObjects...)
 
-			_, err := reconcileObject(t, secretTemplateReconciler, &tc.template)
-			require.Error(t, err)
+			res, err := reconcileObject(t, secretTemplateReconciler, &tc.template)
+			if tc.expectedErrorReturn {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+
+			if tc.expectedRequeueReturn {
+				require.True(t, res.RequeueAfter > 0)
+			}
 
 			var secretTemplate sg2v1alpha1.SecretTemplate
 			err = k8sClient.Get(context.Background(), namespacedNameFor(&tc.template), &secretTemplate)
 			require.NoError(t, err)
 
 			assert.Equal(t, []sgv1alpha1.Condition{
-				{Type: sgv1alpha1.ReconcileFailed, Status: corev1.ConditionTrue, Message: tc.expectedError},
+				{Type: sgv1alpha1.ReconcileFailed, Status: corev1.ConditionTrue, Message: tc.expectedErrorMsg},
 			}, secretTemplate.Status.Conditions)
 
 			var secret corev1.Secret

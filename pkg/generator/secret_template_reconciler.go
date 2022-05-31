@@ -130,7 +130,7 @@ func (r *SecretTemplateReconciler) reconcile(ctx context.Context, secretTemplate
 
 	evaluatedTemplateSecret, err := evaluateTemplate(secretTemplate.Spec.JSONPathTemplate, inputResources)
 	if err != nil {
-		return reconcile.Result{}, err
+		return reconcile.Result{}, errTemporary(secretTemplate, err)
 	}
 
 	// Create/Update Secret
@@ -222,17 +222,18 @@ func (r *SecretTemplateReconciler) resolveInputResources(ctx context.Context, se
 
 		unstructuredResource, err := resolveInputResource(inputResource.Ref, secretTemplate.Namespace, resolvedInputResources)
 		if err != nil {
-			return nil, fmt.Errorf("unable to resolve input resource %s: %w", inputResource.Name, err)
+			return nil, errTemporary(secretTemplate, fmt.Errorf("unable to resolve input resource %s: %w", inputResource.Name, err))
 		}
 
 		key := types.NamespacedName{Namespace: secretTemplate.Namespace, Name: unstructuredResource.GetName()}
 
+		resolvedInputResourceKeys = append(resolvedInputResourceKeys, key)
+
 		if err := inputResourceclient.Get(ctx, key, &unstructuredResource); err != nil {
-			return nil, fmt.Errorf("cannot fetch input resource %s: %w", unstructuredResource.GetName(), err)
+			return nil, errTemporary(secretTemplate, fmt.Errorf("cannot fetch input resource %s: %w", unstructuredResource.GetName(), err))
 		}
 
 		resolvedInputResources[inputResource.Name] = unstructuredResource.UnstructuredContent()
-		resolvedInputResourceKeys = append(resolvedInputResourceKeys, key)
 	}
 
 	return resolvedInputResources, nil
@@ -348,4 +349,16 @@ func evaluateBytes(mapping map[string]string, values map[string]interface{}) (ma
 	}
 
 	return evaluatedMapping, nil
+}
+
+// errTemporary returns the error or the error wrapped in RequeueReconcileErr depending on
+// whether we are tracking the input resources for changes. If we are not tracking we return a
+// RequeueReconcileErr, if we are tracking we return the error.
+// RequeueReconcileErr is useful for non-terminal errors that rely on input resources that may
+// change and we think may eventually succeed.
+func errTemporary(s *sg2v1alpha1.SecretTemplate, err error) error {
+	if shouldTrackInputResources(s) {
+		return err
+	}
+	return reconciler.RequeueReconcileErr{Err: err, RequeueAfter: syncPeriod}
 }
