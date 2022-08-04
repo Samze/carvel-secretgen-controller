@@ -51,6 +51,17 @@ type SecretTemplateSpec struct {
 	// +optional
 	JSONPathTemplate *JSONPathTemplate `json:"template,omitempty"`
 
+	//TODO Q: Do we think we'll ever want ytt metadata? In which case perhaps we want
+	//ytt:
+	//  options:
+	//    debug: true
+	//  template: |
+	//   #@ <mytemplate>
+	//
+	// A YTT based template that can be used to create Secrets.
+	// +optional
+	YTTTemplate *string `json:"ytt,omitempty"`
+
 	// The Service Account used to read InputResources. If not specified, only Secrets can be read as InputResources.
 	// +optional
 	ServiceAccountName string `json:"serviceAccountName,omitempty"`

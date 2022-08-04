@@ -6,16 +6,27 @@ package generator
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
+	"gopkg.in/yaml.v3"
+	yamlk8s "sigs.k8s.io/yaml"
+
 	"github.com/go-logr/logr"
+
 	sgv1alpha1 "github.com/vmware-tanzu/carvel-secretgen-controller/pkg/apis/secretgen/v1alpha1"
 	sg2v1alpha1 "github.com/vmware-tanzu/carvel-secretgen-controller/pkg/apis/secretgen2/v1alpha1"
 	"github.com/vmware-tanzu/carvel-secretgen-controller/pkg/client2/clientset/versioned/scheme"
 	"github.com/vmware-tanzu/carvel-secretgen-controller/pkg/reconciler"
+
+	yttcmd "github.com/vmware-tanzu/carvel-ytt/pkg/cmd/template"
+	yttui "github.com/vmware-tanzu/carvel-ytt/pkg/cmd/ui"
+	yttfiles "github.com/vmware-tanzu/carvel-ytt/pkg/files"
+
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	kerr "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -96,7 +107,7 @@ func (r *SecretTemplateReconciler) Reconcile(ctx context.Context, request reconc
 	secretKey := types.NamespacedName{Namespace: request.Namespace, Name: request.Name}
 	secretTemplate := sg2v1alpha1.SecretTemplate{}
 	if err := r.client.Get(ctx, secretKey, &secretTemplate); err != nil {
-		if errors.IsNotFound(err) {
+		if kerr.IsNotFound(err) {
 			log.Info("Not found")
 
 			// Clear tracking if the SecretTemplate has been deleted.
@@ -128,9 +139,19 @@ func (r *SecretTemplateReconciler) reconcile(ctx context.Context, secretTemplate
 		return reconcile.Result{}, err
 	}
 
-	evaluatedTemplateSecret, err := evaluateTemplate(secretTemplate.Spec.JSONPathTemplate, inputResources)
-	if err != nil {
-		return reconcile.Result{}, err
+	evaluatedTemplateSecret := corev1.Secret{}
+	if secretTemplate.Spec.JSONPathTemplate != nil {
+		evaluatedTemplateSecret, err = evaluateTemplate(secretTemplate.Spec.JSONPathTemplate, inputResources)
+		if err != nil {
+			return reconcile.Result{}, err
+		}
+	} else if secretTemplate.Spec.YTTTemplate != nil {
+		evaluatedTemplateSecret, err = evalulateYtt(*secretTemplate.Spec.YTTTemplate, inputResources)
+		if err != nil {
+			return reconcile.Result{}, err
+		}
+	} else {
+		return reconcile.Result{}, errors.New("either .spec.template or .spec.ytt is required")
 	}
 
 	// Create/Update Secret
@@ -163,6 +184,70 @@ func (r *SecretTemplateReconciler) reconcile(ctx context.Context, secretTemplate
 	}
 
 	return reconcile.Result{}, nil
+}
+
+func evalulateYtt(template string, values map[string]interface{}) (corev1.Secret, error) {
+	yttOpts := yttcmd.NewOptions()
+
+	//TODO Q: Should we enable strict?
+	yttOpts.StrictYAML = false
+
+	inputResourcesYaml, err := yaml.Marshal(values)
+	if err != nil {
+		return corev1.Secret{}, err
+	}
+
+	//Load input resources as data values file
+	yttOpts.DataValuesFlags.FromFiles = []string{"values.yml"}
+	yttOpts.DataValuesFlags.ReadFilesFunc = func(path string) ([]*yttfiles.File, error) {
+		file, err := yttfiles.NewFileFromSource(yttfiles.NewBytesSource("values.yml", inputResourcesYaml))
+		return []*yttfiles.File{file}, err
+	}
+
+	noopUI := yttui.NewCustomWriterTTY(false, noopWriter{}, noopWriter{})
+
+	//Load template
+	input, err := templatesAsInput(template)
+	if err != nil {
+		return corev1.Secret{}, err
+	}
+
+	//Execute template
+	yttout := yttOpts.RunWithFiles(input, noopUI)
+	if yttout.Err != nil {
+		return corev1.Secret{}, yttout.Err
+	}
+
+	yamlResult, err := yttout.DocSet.AsBytes()
+	if err != nil {
+		return corev1.Secret{}, err
+	}
+
+	//Convert to json for ease of marshalling to a corev1.Secret
+	jsonResult, err := yamlk8s.YAMLToJSON(yamlResult)
+	if err != nil {
+		return corev1.Secret{}, err
+	}
+
+	secret := corev1.Secret{}
+	if err := json.Unmarshal(jsonResult, &secret); err != nil {
+		return corev1.Secret{}, err
+	}
+
+	return secret, nil
+}
+
+type noopWriter struct{}
+
+func (w noopWriter) Write(data []byte) (int, error) { return len(data), nil }
+
+func templatesAsInput(tpl string) (yttcmd.Input, error) {
+	file, err := yttfiles.NewFileFromSource(yttfiles.NewBytesSource("template.yml", []byte(tpl)))
+	if err != nil {
+		return yttcmd.Input{}, err
+	}
+
+	return yttcmd.Input{Files: []*yttfiles.File{file}}, nil
 }
 
 func (r *SecretTemplateReconciler) updateStatus(ctx context.Context, secretTemplate *sg2v1alpha1.SecretTemplate) error {

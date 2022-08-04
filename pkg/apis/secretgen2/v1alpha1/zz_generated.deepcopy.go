@@ -370,6 +370,11 @@ func (in *SecretTemplateSpec) DeepCopyInto(out *SecretTemplateSpec) {
 		*out = new(JSONPathTemplate)
 		(*in).DeepCopyInto(*out)
 	}
+	if in.YTTTemplate != nil {
+		in, out := &in.YTTTemplate, &out.YTTTemplate
+		*out = new(string)
+		**out = **in
+	}
 	return
 }
 

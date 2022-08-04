@@ -244,6 +244,9 @@ spec:
                     description: Type is the type of Kubernetes Secret
                     type: string
                 type: object
+              ytt:
+                description: A YTT based template that can be used to create Secrets.
+                type: string
             required:
             - inputResources
             type: object
